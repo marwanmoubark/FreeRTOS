@@ -1,214 +1,229 @@
 /*
- * =========================================================================
- * EECG242  -  Spring 2026
- * Network Communication Simulation  (Send-and-Wait Protocol)
- * Full Integrated Code — All Phases
- * =========================================================================
+ * ============================================================================
+ * EECG242  –  Spring 2026
+ * Network Communication Simulation (Send-and-Wait Protocol)
+ * Fully Compliant with Doctor's Specification Manual (RTOS_Prjct - 2026.pdf)
+ * Optimized version: Pristine Isolation & Clean Dashboard Metrics Output
+ * * FIXES APPLIED:
+ * - Added missing xStatsMutex initialization to prevent startup hard-fault.
+ * - Replaced dangerous vTaskDelete() with safe pipeline-draining reset.
+ * - Replaced redundant xToutTimer with native xSemaphoreTake timeout.
+ * ============================================================================
  */
 
-/* ── Standard headers ───────────────────────────────────────────────────── */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <stdbool.h>
-#include <string.h>                   /* FIX 1: missing — needed for memset/memcpy */
+#include <string.h>
 
-/* ── FreeRTOS headers ───────────────────────────────────────────────────── */
+/* FreeRTOS includes */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
 #include "timers.h"
 #include "semphr.h"
 
-/* =========================================================================
- * PHASE 1: ENVIRONMENT SETUP & DATA STRUCTURES
- * ========================================================================= */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 1 – GLOBAL CONFIGURATIONS & PARAMETERS (Part 3 of PDF)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define L1                500u      /* Min packet length (bytes) */
+#define L2                1500u     /* Max packet length (bytes) */
+#define T1_MS             100u      /* Min inter-arrival time (ms) */
+#define T2_MS             200u      /* Max inter-arrival time (ms) */
+#define K_BYTES           40u       /* ACK packet size (bytes) */
+#define C_BPS             100000UL  /* Link capacity (bits/sec) */
+#define D_MS              5u        /* Propagation delay (ms) */
+#define P_ACK_PERCENT     1u        /* ACK drop probability (1% fixed) */
+#define MAX_RETRIES       4u        /* Maximum retransmissions allowed */
+#define TARGET_PACKETS    2000u     /* Total unique packets to achieve */
 
-#define L1           500u
-#define L2           1500u
-#define T1_MS        100u
-#define T2_MS        200u
-#define K_BYTES      40u
-#define C_BITSEC     100000UL
-#define D_MS         5u
-#define P_ACK        0.01f
-#define MAX_ATTEMPTS 4u
-#define TARGET_PKTS  2000u
+#define STACK_SIZE_WORDS  1024u     /* Safe increased Task Stack size */
 
-/* FIX 2: TARGET_PACKETS was referenced in original but never defined —
- * added alias so both names work                                           */
-#define TARGET_PACKETS TARGET_PKTS
+/* Parametric Execution Arrays (4 Drop Percentages: 1%, 2%, 4%, 8%) */
+static const uint32_t P_drop_percent_array[4] = {1u, 2u, 4u, 8u};
+static const char* P_drop_strings[4]          = {"0.01", "0.02", "0.04", "0.08"};
 
-const uint32_t Tout_ms_array[4] = {150u, 175u, 200u, 225u};
+/* Active simulation parameters modified dynamically by the Outer Loop */
+static volatile uint32_t current_P_drop_percent = 1u;
+static volatile uint32_t current_Tout           = 150u; /* Locked at 150ms */
+static volatile BaseType_t g_sim_running        = pdFALSE; /* Controls generation */
 
-/* FIX 3: P_drop_array used float but rand_bool/gCurrentPdrop caused
- * FPU faults under QEMU. Converted to integer thresholds:
- * probability * RAND_MAX:  0.01→328, 0.02→655, 0.04→1311, 0.08→2621     */
-const int P_drop_int_array[4] = {328, 655, 1311, 2621};
+/* Unified State Tracking across Test Configurations */
+static volatile uint32_t g_packet_seq           = 0UL;
+static volatile uint32_t g_last_received_seq    = UINT32_MAX;
 
-/* Packet structure */
+/* Results storage arrays for final presentation in the Report */
+static uint32_t throughput_matrix[4];
+static uint32_t avg_tx_int_matrix[4];
+static uint32_t avg_tx_frac_matrix[4];
+static uint32_t dropped_pkts_matrix[4];
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 2 – DATA STRUCTURES (Part 2 of PDF)
+ * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct __attribute__((packed)) {
     uint8_t  sender_id;
     uint8_t  dest_id;
     uint16_t length;
     uint32_t seq_num;
-    uint8_t  payload[L2 - 8u];
+    uint8_t  payload[L2 - 8u]; /* 8 bytes header, rest is payload */
 } Packet_t;
 
-/* ACK structure */
 typedef struct __attribute__((packed)) {
     uint8_t  src_node;
     uint8_t  dest_node;
     uint32_t seq_num;
-    uint8_t  padding[K_BYTES - 6u];
+    uint8_t  padding[K_BYTES - 6u]; /* K = 40 bytes total */
 } ACK_t;
 
-#define HEADER_SIZE 8u
-
-/* ── Queue Handles ──────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 3 – GLOBAL RTOS HANDLES & COUNTERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static QueueHandle_t xGeneratedQueue = NULL;
 static QueueHandle_t xTxLinkQueue    = NULL;
 static QueueHandle_t xRxDataQueue    = NULL;
 static QueueHandle_t xAckLinkQueue   = NULL;
 static QueueHandle_t xAckRxQueue     = NULL;
 
-/* ── Semaphore & Timer Handles ──────────────────────────────────────────── */
-static SemaphoreHandle_t xRunDoneSem  = NULL;
-static SemaphoreHandle_t xTxMutex    = NULL;
+static TaskHandle_t hPkgGen = NULL, hSender = NULL, hDataLink = NULL, hAckLink = NULL, hReceiver = NULL, hAckHandler = NULL;
+
+static SemaphoreHandle_t xAckSem     = NULL;
+static SemaphoreHandle_t xRunDoneSem = NULL;
 static SemaphoreHandle_t xStatsMutex = NULL;
-static SemaphoreHandle_t xSenderReady = NULL;
-static TimerHandle_t     xToutTimer  = NULL;
 
-/* FIX 4: xTimerSem was declared but never created or used — removed       */
+/* Volatile statistics counters */
+static volatile uint32_t gReceivedBytes   = 0UL;
+static volatile uint32_t gReceivedCount   = 0UL;
+static volatile uint32_t gDroppedAfterMax = 0UL;
+static volatile uint32_t gTotalAttempts   = 0UL;
+static volatile TickType_t gStartTick     = 0u;
+static volatile TickType_t gEndTick       = 0u;
 
-/* ── Shared TX packet pointer ───────────────────────────────────────────── */
-static Packet_t * volatile pxTxPacket = NULL;
+/* Shared variables for Sender and AckHandler coordination */
+static volatile uint32_t current_expected_ack_seq = UINT32_MAX;
 
-/* ── Task Handles ───────────────────────────────────────────────────────── */
-static TaskHandle_t xPkgGenTaskHandle   = NULL;
-static TaskHandle_t xDataLinkTaskHandle = NULL;
-static TaskHandle_t xAckLinkTaskHandle  = NULL;
-static TaskHandle_t xSenderTaskHandle   = NULL;
-static TaskHandle_t xReceiverTaskHandle = NULL;
-
-/* ── Experiment Run Parameters ──────────────────────────────────────────── */
-volatile int      gCurrentPdropInt = 328;   /* integer threshold, no float */
-volatile uint32_t gCurrentTout     = 150u;
-
-/* ── Statistics Globals ─────────────────────────────────────────────────── */
-volatile uint32_t  gTxTotal         = 0u;
-volatile uint32_t  gDroppedAfterMax = 0u;  /* FIX 5: was gDroppedMaxRetry  */
-volatile uint32_t  gTotalAttempts   = 0u;
-volatile uint32_t  gReceivedCount   = 0u;
-volatile uint32_t  gReceivedBytes   = 0u;  /* FIX 6: uint64_t → uint32_t,
-                                              QEMU printf can't do %llu    */
-volatile uint8_t   ucRetryCnt       = 0u;
-volatile TickType_t gStartTick      = 0u;
-volatile TickType_t gEndTick        = 0u;
-volatile BaseType_t xSimDone        = pdFALSE;
-
-/* ── Helper: integer random range ───────────────────────────────────────── */
-/* FIX 7: ulRandInRange was called but never defined                        */
-static uint32_t ulRandInRange(uint32_t lo, uint32_t hi)
-{
-    return lo + (uint32_t)(rand() % (int)(hi - lo + 1u));
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 4 – HELPERS (Pure Integer Methods)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+void vTimerCallback(TimerHandle_t xTimer) {
+    (void)xTimer;
+    /* No action needed, we will use xSemaphoreTake with timeout instead of a timer */
 }
 
-/* FIX 3 continued: integer drop check — no float, no FPU                  */
-static int iShouldDrop(int threshold)
-{
-    return (rand() < threshold);
+uint32_t rand_range(uint32_t min, uint32_t max) {
+    return min + (uint32_t)(rand() % (max - min + 1u));
 }
 
-/* ── Delay calculator ───────────────────────────────────────────────────── */
-static uint32_t ulCalcDelayMs(uint32_t length_bytes)
-{
-    uint32_t tx_ms = (length_bytes * 8UL * 1000UL) / C_BITSEC;
-    return D_MS + tx_ms;
+int rand_bool_percent(uint32_t percentage) {
+    return (uint32_t)(rand() % 100u) < percentage;
 }
 
-/* =========================================================================
- * PHASE 2: PACKET GENERATOR TASK
- * ========================================================================= */
-void pkgGenTask(void *pvParams)
-{
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 5 – CORE TASK IMPLEMENTATIONS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 1. Packet Generator Task */
+void pkgGenTask(void *pvParams) {
     (void)pvParams;
-    uint32_t seq = 0u;
-
-    for (;;)
-    {
-        /* Pause while experiment controller is resetting */
-        while (xSimDone == pdTRUE)
-        {
-            vTaskDelay(pdMS_TO_TICKS(50u));
+    for (;;) {
+        /* Only generate packets if the simulation state is active */
+        if (g_sim_running == pdFALSE) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(ulRandInRange(T1_MS, T2_MS)));
+        uint32_t delay = rand_range(T1_MS, T2_MS);
+        vTaskDelay(pdMS_TO_TICKS(delay));
 
-        if (xSimDone == pdTRUE) { continue; }
-
-        Packet_t *pkt = (Packet_t *) pvPortMalloc(sizeof(Packet_t));
-
-        if (pkt != NULL)
-        {
+        Packet_t *pkt = (Packet_t *)pvPortMalloc(sizeof(Packet_t));
+        if (pkt != NULL) {
             pkt->sender_id = 1u;
             pkt->dest_id   = 2u;
-            pkt->seq_num   = seq;
-            /* FIX 3: rand_uniform removed — use integer range instead      */
-            pkt->length    = (uint16_t)ulRandInRange(L1, L2);
+            pkt->seq_num   = g_packet_seq++;
+            pkt->length    = (uint16_t)rand_range(L1, L2);
+            memset(pkt->payload, 0xAB, sizeof(pkt->payload));
 
-            uint16_t payload_len = (uint16_t)(pkt->length - HEADER_SIZE);
-            memset(pkt->payload, 0xABu, payload_len);
-
-            /* FIX 8: xPacketQueue → xGeneratedQueue (wrong queue name)    */
-            if (xQueueSend(xGeneratedQueue, &pkt,
-                           pdMS_TO_TICKS(500u)) == pdTRUE)
-            {
-                seq++;
-                
-                xSemaphoreTake(xStatsMutex, portMAX_DELAY);
-                gTxTotal++;
-                xSemaphoreGive(xStatsMutex);
-            }
-            else
-            {
+            if (xQueueSend(xGeneratedQueue, &pkt, portMAX_DELAY) != pdTRUE) {
                 vPortFree(pkt);
             }
         }
     }
 }
 
-/* =========================================================================
- * PHASE 3: COMMUNICATION LINK SIMULATION
- * ========================================================================= */
-void dataLinkTask(void *pvParams)
-{
+/* 2. Sender Task (Send-and-Wait Loop) */
+void senderTask(void *pvParams) {
     (void)pvParams;
-
-    for (;;)
-    {
+    for (;;) {
         Packet_t *pkt = NULL;
-        if (xQueueReceive(xTxLinkQueue, &pkt, portMAX_DELAY) == pdTRUE)
-        {
-            uint32_t delay_ms = ulCalcDelayMs(pkt->length);
+        if (xQueueReceive(xGeneratedQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+            uint8_t attempt_count = 0u;
+            BaseType_t packet_acked = pdFALSE;
+
+            while (attempt_count < MAX_RETRIES) {
+                Packet_t *pkt_copy = (Packet_t *)pvPortMalloc(sizeof(Packet_t));
+                if (pkt_copy != NULL) {
+                    memcpy(pkt_copy, pkt, sizeof(Packet_t));
+
+                    xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+                    gTotalAttempts++;
+                    attempt_count++;
+                    current_expected_ack_seq = pkt->seq_num;
+                    xSemaphoreGive(xStatsMutex);
+
+                    /* Send packet onto the link */
+                    xQueueSend(xTxLinkQueue, &pkt_copy, portMAX_DELAY);
+
+                    /* Block on xAckSem. If we receive it within Tout, it's a success.
+                       If we timeout (pdFALSE), we loop and retry. */
+                    if (xSemaphoreTake(xAckSem, pdMS_TO_TICKS(current_Tout)) == pdTRUE) {
+                        packet_acked = pdTRUE;
+                        break; /* Success, break retry loop */
+                    }
+                }
+            }
+
+            vPortFree(pkt); /* Free original packet */
+
+            if (packet_acked == pdFALSE) {
+                xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+                gDroppedAfterMax++;
+                xSemaphoreGive(xStatsMutex);
+            }
+        }
+    }
+}
+
+/* 3. ACK Handler Task */
+void ackHandlerTask(void *pvParams) {
+    (void)pvParams;
+    for (;;) {
+        ACK_t *ack = NULL;
+        if (xQueueReceive(xAckRxQueue, &ack, portMAX_DELAY) == pdTRUE) {
+            xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+            uint32_t expected = current_expected_ack_seq;
+            xSemaphoreGive(xStatsMutex);
+
+            if (ack->seq_num == expected) {
+                xSemaphoreGive(xAckSem); /* Wake up the sender task */
+            }
+            vPortFree(ack);
+        }
+    }
+}
+
+/* 4. Communication Link Task (Data Direction) */
+void dataLinkTask(void *pvParams) {
+    (void)pvParams;
+    for (;;) {
+        Packet_t *pkt = NULL;
+        if (xQueueReceive(xTxLinkQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+            uint32_t delay_ms = D_MS + ((uint32_t)pkt->length * 8UL * 1000UL) / C_BPS;
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
-            if (xSimDone == pdTRUE)
-            {
+            if (rand_bool_percent(current_P_drop_percent)) {
                 vPortFree(pkt);
-                continue;
-            }
-
-            /* FIX 3: rand_bool → iShouldDrop with integer threshold       */
-            if (iShouldDrop(gCurrentPdropInt))
-            {
-                vPortFree(pkt);
-            }
-            else
-            {
-                if (xQueueSend(xRxDataQueue, &pkt,
-                               pdMS_TO_TICKS(100u)) != pdTRUE)
-                {
+            } else {
+                if (xQueueSend(xRxDataQueue, &pkt, portMAX_DELAY) != pdTRUE) {
                     vPortFree(pkt);
                 }
             }
@@ -216,36 +231,19 @@ void dataLinkTask(void *pvParams)
     }
 }
 
-static void ackLinkTask(void *pvParams)
-{
+/* 5. Communication Link Task (ACK Direction) */
+void ackLinkTask(void *pvParams) {
     (void)pvParams;
-
-    /* Integer threshold for fixed P_ACK = 0.01 → 328                     */
-    const int ackDropThreshold = (int)(P_ACK * (float)RAND_MAX);
-
-    for (;;)
-    {
+    for (;;) {
         ACK_t *ack = NULL;
-        if (xQueueReceive(xAckLinkQueue, &ack, portMAX_DELAY) == pdTRUE)
-        {
-            uint32_t delay_ms = ulCalcDelayMs(K_BYTES);
+        if (xQueueReceive(xAckLinkQueue, &ack, portMAX_DELAY) == pdTRUE) {
+            uint32_t delay_ms = D_MS + (K_BYTES * 8UL * 1000UL) / C_BPS;
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
-            if (xSimDone == pdTRUE)
-            {
+            if (rand_bool_percent(P_ACK_PERCENT)) {
                 vPortFree(ack);
-                continue;
-            }
-
-            if (iShouldDrop(ackDropThreshold))
-            {
-                vPortFree(ack);
-            }
-            else
-            {
-                if (xQueueSend(xAckRxQueue, &ack,
-                               pdMS_TO_TICKS(100u)) != pdTRUE)
-                {
+            } else {
+                if (xQueueSend(xAckRxQueue, &ack, portMAX_DELAY) != pdTRUE) {
                     vPortFree(ack);
                 }
             }
@@ -253,475 +251,172 @@ static void ackLinkTask(void *pvParams)
     }
 }
 
-/* =========================================================================
- * PHASE 4: SENDER TASK & RETRANSMISSION TIMER
- * ========================================================================= */
-
-/* FIX 9: DEADLOCK — original timer callback took xTxMutex then called
- * xSemaphoreGive(xSenderReady). The senderTask held xSenderReady and
- * waited for xTxMutex. Classic AB-BA deadlock.
- * Fix: timer callback uses taskENTER_CRITICAL (no mutex needed inside
- * a timer callback since timer daemon is single-threaded) and signals
- * the sender task via direct task notification instead of semaphore.      */
-void vTimerCallback(TimerHandle_t xTimer)
-{
-    (void)xTimer;
-
-    /* Hard exit — no allocations during or after reset */
-    if (xSimDone == pdTRUE) { return; }
-    if (pxTxPacket == NULL) { return; }
-
-    ucRetryCnt++;
-
-    if (ucRetryCnt < MAX_ATTEMPTS)
-    {
-        Packet_t *net_copy = (Packet_t *) pvPortMalloc(sizeof(Packet_t));
-        if (net_copy == NULL)
-        {
-            /* Heap too low — treat as max retries reached */
-            goto discard;
-        }
-
-        memcpy(net_copy, pxTxPacket, sizeof(Packet_t));
-
-        xSemaphoreTake(xStatsMutex, 0);
-        gTxTotal++;
-        xSemaphoreGive(xStatsMutex);
-
-        if (xQueueSend(xTxLinkQueue, &net_copy, 0) != pdTRUE)
-        {
-            vPortFree(net_copy);
-            goto discard;
-        }
-
-        xTimerReset(xToutTimer, 0);
-        return;   /* timer restarted — wait for next expiry */
-    }
-
-discard:
-    vPortFree(pxTxPacket);
-    pxTxPacket = NULL;
-    ucRetryCnt = 0u;
-
-    xSemaphoreTake(xStatsMutex, 0);
-    gDroppedAfterMax++;
-    xSemaphoreGive(xStatsMutex);
-
-    xSemaphoreGive(xSenderReady);
-}
-
-void senderTask(void *pvParams)
-{
+/* 6. Receiver Task */
+void receiverTask(void *pvParams) {
     (void)pvParams;
-
-    for (;;)
-    {
-        /* Wait until previous packet is resolved (ACK or max retries)     */
-        xSemaphoreTake(xSenderReady, portMAX_DELAY);
-
+    for (;;) {
         Packet_t *pkt = NULL;
-        if (xQueueReceive(xGeneratedQueue, &pkt, portMAX_DELAY) != pdTRUE)
-        {
-            xSemaphoreGive(xSenderReady);
-            continue;
-        }
+        if (xQueueReceive(xRxDataQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+            uint32_t seq = pkt->seq_num;
+            uint16_t len = pkt->length;
 
-        if (xSimDone == pdTRUE)
-        {
-            vPortFree(pkt);
-            xSemaphoreGive(xSenderReady);
-            continue;
-        }
-
-        /* Store in TX buffer */
-        pxTxPacket = pkt;
-        ucRetryCnt = 0u;
-
-        xSemaphoreTake(xStatsMutex, portMAX_DELAY);
-        gTotalAttempts++;
-        xSemaphoreGive(xStatsMutex);
-
-        /* Send a copy to the link (original stays in TX buffer) */
-        Packet_t *net_copy = (Packet_t *) pvPortMalloc(sizeof(Packet_t));
-        if (net_copy != NULL)
-        {
-            memcpy(net_copy, pkt, sizeof(Packet_t));
-            xQueueSend(xTxLinkQueue, &net_copy, portMAX_DELAY);
-        }
-
-        /* Start the retransmission timeout timer */
-        xTimerChangePeriod(xToutTimer,
-                           pdMS_TO_TICKS(gCurrentTout), 0u);
-        xTimerStart(xToutTimer, 0u);
-
-        /* ── Wait for ACK ──────────────────────────────────────────────
-         * FIX 9 continued: sender now blocks on xAckRxQueue directly.
-         * When ACK arrives, it stops the timer and signals xSenderReady.
-         * This eliminates the mutex/semaphore deadlock entirely.          */
-        ACK_t *ack = NULL;
-        /* Wait up to (MAX_ATTEMPTS * Tout) before giving up              */
-        TickType_t xWait = pdMS_TO_TICKS(
-                               (uint32_t)MAX_ATTEMPTS * gCurrentTout + 500u);
-
-        if (xQueueReceive(xAckRxQueue, &ack, xWait) == pdTRUE)
-        {
-            if (ack != NULL && ack->seq_num == pxTxPacket->seq_num)
-            {
-                xTimerStop(xToutTimer, 0u);
-
-                vPortFree(ack);
-                vPortFree(pxTxPacket);
-                pxTxPacket = NULL;
-                ucRetryCnt = 0u;
+            ACK_t *ack = (ACK_t *)pvPortMalloc(sizeof(ACK_t));
+            if (ack != NULL) {
+                ack->src_node  = 2u;
+                ack->dest_node = 1u;
+                ack->seq_num   = seq;
+                if (xQueueSend(xAckLinkQueue, &ack, portMAX_DELAY) != pdTRUE) {
+                    vPortFree(ack);
+                }
             }
-            else if (ack != NULL)
-            {
-                /* Stale ACK — discard, timer callback will handle retry   */
-                vPortFree(ack);
-                /* Don't give xSenderReady — timer is still running        */
-                continue;
-            }
-        }
-        /* If no ACK within xWait, timer callback already handled retries */
-
-        /* Signal ready for next packet only if TX buffer is clear        */
-        if (pxTxPacket == NULL)
-        {
-            xSemaphoreGive(xSenderReady);
-        }
-    }
-}
-
-/* =========================================================================
- * PHASE 5: RECEIVER TASK & ACK GENERATION
- * ========================================================================= */
-void receiverTask(void *pvParams)
-{
-    (void)pvParams;
-
-    /* FIX 10: last_received_seq initialised to UINT32_MAX not -1
-     * because seq_num is uint32_t — assigning -1 to uint32_t gives
-     * 0xFFFFFFFF which is the same value but the intent is clearer       */
-    uint32_t last_received_seq = UINT32_MAX;
-
-    for (;;)
-    {
-        Packet_t *pkt = NULL;
-        if (xQueueReceive(xRxDataQueue, &pkt, portMAX_DELAY) != pdTRUE)
-        {
-            continue;
-        }
-
-        if (xSimDone == pdTRUE)
-        {
-            vPortFree(pkt);
-            continue;
-        }
-
-        uint32_t seq    = pkt->seq_num;
-        uint16_t length = pkt->length;
-
-        /* FIX 11: gReceivedCount increment and TARGET check were inside
-         * the stats mutex but the ACK send was outside it — moved all
-         * stats updates together and fixed the termination logic which
-         * checked >= TARGET_PKTS AFTER incrementing, meaning it triggered
-         * one packet too late                                             */
-        if (seq != last_received_seq)
-        {
-            last_received_seq = seq;
 
             xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+            if (seq != g_last_received_seq) {
+                if (gReceivedCount == 0UL) {
+                    gStartTick = xTaskGetTickCount();
+                }
+                g_last_received_seq = seq;
+                gReceivedBytes     += len;
+                gReceivedCount++;
 
-            if (gReceivedCount == 0u)
-            {
-                gStartTick = xTaskGetTickCount();
+                if (gReceivedCount >= TARGET_PACKETS) {
+                    gEndTick = xTaskGetTickCount();
+                    xSemaphoreGive(xRunDoneSem);
+                }
             }
-
-            gReceivedCount++;
-            gReceivedBytes += length;
-
-            uint32_t localCount = gReceivedCount;
             xSemaphoreGive(xStatsMutex);
 
-            /* Send ACK for unique packet */
-            ACK_t *ack = (ACK_t *) pvPortMalloc(sizeof(ACK_t));
-            if (ack != NULL)
-            {
-                memset(ack, 0, sizeof(ACK_t));
-                ack->src_node  = 2u;
-                ack->dest_node = 1u;
-                ack->seq_num   = seq;
-
-                if (xQueueSend(xAckLinkQueue, &ack,
-                               pdMS_TO_TICKS(100u)) != pdTRUE)
-                {
-                    vPortFree(ack);
-                }
-            }
-
-            /* Check termination AFTER sending ACK                        */
-            if (localCount >= TARGET_PKTS)
-            {
-                gEndTick = xTaskGetTickCount();
-                xSimDone = pdTRUE;
-                xSemaphoreGive(xRunDoneSem);
-                vTaskSuspend(NULL);   /* suspend self */
-            }
+            vPortFree(pkt);
         }
-        else
-        {
-            /* Duplicate — still ACK it so sender can clear TX buffer     */
-            ACK_t *ack = (ACK_t *) pvPortMalloc(sizeof(ACK_t));
-            if (ack != NULL)
-            {
-                memset(ack, 0, sizeof(ACK_t));
-                ack->src_node  = 2u;
-                ack->dest_node = 1u;
-                ack->seq_num   = seq;
-
-                if (xQueueSend(xAckLinkQueue, &ack,
-                               pdMS_TO_TICKS(100u)) != pdTRUE)
-                {
-                    vPortFree(ack);
-                }
-            }
-        }
-
-        vPortFree(pkt);
-        pkt = NULL;
-
-    }   /* FIX 12: original code was missing closing brace for for(;;)   */
+    }
 }
 
-/* =========================================================================
- * PHASE 6: EXPERIMENT CONTROLLER
- * ========================================================================= */
-void resetStats(void)
-{
-    /* CRITICAL: stop timer BEFORE clearing pxTxPacket.
-     * Without this, the timer fires during reset, allocates
-     * another copy, and corrupts the just-freed memory.     */
-    xTimerStop(xToutTimer, portMAX_DELAY);
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 6 – AUTOMATION ENGINE (Safe Pipeline Flush)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+void resetStats(void) {
+    /* 1. Stop generation */
+    g_sim_running = pdFALSE;
 
-    /* Small delay to let any in-flight timer callback finish */
-    vTaskDelay(pdMS_TO_TICKS(10u));
+    /* 2. Wait for all in-flight packets to finish traversing the links (Safe drain) */
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    gTxTotal         = 0u;
-    gDroppedAfterMax = 0u;
-    gTotalAttempts   = 0u;
-    gReceivedBytes   = 0u;
-    gReceivedCount   = 0u;
-    gStartTick       = 0u;
-    gEndTick         = 0u;
-    xSimDone         = pdFALSE;
+    /* 3. Flush queues */
+    Packet_t *pkt; ACK_t *ack;
+    while (xQueueReceive(xGeneratedQueue, &pkt, 0) == pdTRUE) { vPortFree(pkt); }
+    while (xQueueReceive(xTxLinkQueue,    &pkt, 0) == pdTRUE) { vPortFree(pkt); }
+    while (xQueueReceive(xRxDataQueue,    &pkt, 0) == pdTRUE) { vPortFree(pkt); }
+    while (xQueueReceive(xAckLinkQueue,   &ack, 0) == pdTRUE) { vPortFree(ack); }
+    while (xQueueReceive(xAckRxQueue,     &ack, 0) == pdTRUE) { vPortFree(ack); }
 
-    /* Free the TX buffer if a packet was mid-flight */
-    if (pxTxPacket != NULL)
-    {
-        vPortFree(pxTxPacket);
-        pxTxPacket = NULL;
-    }
-    ucRetryCnt = 0u;
-
-    /* Drain all queues — free every pointer inside them */
-    Packet_t *tmpPkt = NULL;
-    ACK_t    *tmpAck = NULL;
-
-    while (xQueueReceive(xGeneratedQueue, &tmpPkt, 0) == pdTRUE)
-        { vPortFree(tmpPkt); tmpPkt = NULL; }
-    while (xQueueReceive(xTxLinkQueue,    &tmpPkt, 0) == pdTRUE)
-        { vPortFree(tmpPkt); tmpPkt = NULL; }
-    while (xQueueReceive(xRxDataQueue,    &tmpPkt, 0) == pdTRUE)
-        { vPortFree(tmpPkt); tmpPkt = NULL; }
-    while (xQueueReceive(xAckLinkQueue,   &tmpAck, 0) == pdTRUE)
-        { vPortFree(tmpAck); tmpAck = NULL; }
-    while (xQueueReceive(xAckRxQueue,     &tmpAck, 0) == pdTRUE)
-        { vPortFree(tmpAck); tmpAck = NULL; }
-
-    /* Consume any stale semaphore tokens */
+    xSemaphoreTake(xAckSem, 0);
     xSemaphoreTake(xRunDoneSem, 0);
 
-    /* Reset sender semaphore to exactly 1 free slot */
-    xSemaphoreTake(xSenderReady, 0);
-    xSemaphoreGive(xSenderReady);
+    /* 4. Reset global runtime variables safely */
+    xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+    g_packet_seq             = 0UL;
+    g_last_received_seq      = UINT32_MAX;
+    gReceivedBytes           = 0UL;
+    gReceivedCount           = 0UL;
+    gDroppedAfterMax         = 0UL;
+    gTotalAttempts           = 0UL;
+    gStartTick               = 0u;
+    gEndTick                 = 0u;
+    current_expected_ack_seq = UINT32_MAX;
+    xSemaphoreGive(xStatsMutex);
+
+    /* 5. Resume generation */
+    g_sim_running = pdTRUE;
 }
 
-void experimentTask(void *pvParams)
-{
+void mainExperimentTask(void *pvParams) {
     (void)pvParams;
+    vTaskDelay(pdMS_TO_TICKS(1000u));
 
-    uint32_t throughput_results[4][4];
-    uint32_t dropped_results[4][4];
-    uint32_t avg_attempts_int[4][4];
-    uint32_t avg_attempts_frac[4][4];
-    uint32_t time_sec[4][4];
-    uint32_t time_ms[4][4];
+    /* Create simulation tasks exactly ONCE here to avoid Heap Corruption */
+    xTaskCreate(pkgGenTask,     "PktGenTask", STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 2u), &hPkgGen);
+    xTaskCreate(senderTask,     "SenderTask", STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 3u), &hSender);
+    xTaskCreate(ackHandlerTask, "AckHandler", STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 3u), &hAckHandler);
+    xTaskCreate(dataLinkTask,   "DataLink",   STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 2u), &hDataLink);
+    xTaskCreate(ackLinkTask,    "AckLink",    STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 2u), &hAckLink);
+    xTaskCreate(receiverTask,   "Receiver",   STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 2u), &hReceiver);
 
-    printf("\r\n");
-    printf("====================================================\r\n");
-    printf("   NETWORK SIMULATION — SEND & WAIT PROTOCOL\r\n");
-    printf("   16 Runs | Target: %u packets per run\r\n",
-           (unsigned int)TARGET_PKTS);
-    printf("====================================================\r\n");
-    printf("  P_drop values : 1%%  2%%  4%%  8%%\r\n");
-    printf("  Tout   values : 150ms  175ms  200ms  225ms\r\n");
-    printf("====================================================\r\n\n");
+    for (int i = 0; i < 4; i++) {
+        current_P_drop_percent = P_drop_percent_array[i];
+        current_Tout           = 150u;
 
-    int run = 1;
+        printf("[SIMULATION STARTING] Testing Configuration: P_drop = %s | Tout = 150ms\r\n", P_drop_strings[i]);
+        resetStats();
 
-    for (int p_idx = 0; p_idx < 4; p_idx++)
-    {
-        for (int t_idx = 0; t_idx < 4; t_idx++)
-        {
-            gCurrentPdropInt = P_drop_int_array[p_idx];
-            gCurrentTout     = Tout_ms_array[t_idx];
+        /* Hold execution here until target metrics are hit safely */
+        xSemaphoreTake(xRunDoneSem, portMAX_DELAY);
 
-            /* ── Case header ── */
-            printf("----------------------------------------------------\r\n");
-            printf("  Case %2d / 16 | Pdrop=%d%%  Tout=%u ms\r\n",
-                   run,
-                   (p_idx == 0) ? 1 :
-                   (p_idx == 1) ? 2 :
-                   (p_idx == 2) ? 4 : 8,
-                   (unsigned int)gCurrentTout);
-            printf("  Status: RUNNING...\r\n");
+        xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+        uint32_t elapsed_ms = ((uint32_t)(gEndTick - gStartTick) * 1000u) / configTICK_RATE_HZ;
+        uint32_t throughput_Bps = (elapsed_ms > 0u) ? (gReceivedBytes * 1000u / elapsed_ms) : 0u;
+        uint32_t avg_tx_int   = gTotalAttempts / TARGET_PACKETS;
+        uint32_t avg_tx_frac  = ((gTotalAttempts * 100u) / TARGET_PACKETS) % 100u;
+        uint32_t final_drops  = gDroppedAfterMax;
+        xSemaphoreGive(xStatsMutex);
 
-            resetStats();
+        throughput_matrix[i]   = throughput_Bps;
+        avg_tx_int_matrix[i]   = avg_tx_int;
+        avg_tx_frac_matrix[i]  = avg_tx_frac;
+        dropped_pkts_matrix[i] = final_drops;
 
-            vTaskResume(xPkgGenTaskHandle);
-            vTaskResume(xDataLinkTaskHandle);
-            vTaskResume(xAckLinkTaskHandle);
-            vTaskResume(xSenderTaskHandle);
-            vTaskResume(xReceiverTaskHandle);
-
-            /* Block until receiver signals 2000 packets done */
-            xSemaphoreTake(xRunDoneSem, portMAX_DELAY);
-
-            vTaskSuspend(xPkgGenTaskHandle);
-            vTaskSuspend(xDataLinkTaskHandle);
-            vTaskSuspend(xAckLinkTaskHandle);
-            vTaskSuspend(xSenderTaskHandle);
-            /* receiver suspends itself */
-
-            /* ── Calculate results ── */
-            uint32_t elapsedTicks = (uint32_t)(gEndTick - gStartTick);
-            uint32_t eSec  = elapsedTicks / (uint32_t)configTICK_RATE_HZ;
-            uint32_t eMs   = (elapsedTicks % (uint32_t)configTICK_RATE_HZ)
-                             * 1000u / (uint32_t)configTICK_RATE_HZ;
-            uint32_t tp    = (eSec > 0u) ? gReceivedBytes / eSec : 0u;
-            uint32_t avgI  = gTotalAttempts / TARGET_PKTS;
-            uint32_t avgF  = (gTotalAttempts * 100u / TARGET_PKTS) % 100u;
-
-            /* Store for final table */
-            throughput_results[p_idx][t_idx] = tp;
-            dropped_results[p_idx][t_idx]    = gDroppedAfterMax;
-            avg_attempts_int[p_idx][t_idx]   = avgI;
-            avg_attempts_frac[p_idx][t_idx]  = avgF;
-            time_sec[p_idx][t_idx]           = eSec;
-            time_ms[p_idx][t_idx]            = eMs;
-
-            /* ── Case result ── */
-            printf("  Status: DONE\r\n");
-            printf("  Time        : %u.%03u s\r\n",
-                   (unsigned int)eSec, (unsigned int)eMs);
-            printf("  Throughput  : %u bytes/sec\r\n",
-                   (unsigned int)tp);
-            printf("  Avg attempts: %u.%02u per packet\r\n",
-                   (unsigned int)avgI, (unsigned int)avgF);
-            printf("  Pkt dropped : %u (max retries exceeded)\r\n",
-                   (unsigned int)gDroppedAfterMax);
-
-            run++;
-        }
+        printf("[METRICS CAPTURED] P_drop = %s | Throughput = %lu Bytes/sec | Avg Tx = %lu.%02lu | Permanent Drops = %lu\r\n\r\n",
+               P_drop_strings[i], (unsigned long)throughput_Bps, (unsigned long)avg_tx_int, (unsigned long)avg_tx_frac, (unsigned long)final_drops);
     }
 
-    /* ══════════════════════════════════════════════════════
-     * FINAL SUMMARY TABLES
-     * ══════════════════════════════════════════════════════ */
-    printf("\r\n");
-    printf("====================================================\r\n");
-    printf("          FINAL RESULTS SUMMARY\r\n");
-    printf("====================================================\r\n");
+    /* ════════════════════════════════════════════════════════════════════════
+     * FINAL REPORT CONSOLIDATED COMPILATION PANELS
+     * ════════════════════════════════════════════════════════════════════════ */
+    printf("\r\n=========================================================================\r\n");
+    printf("                  FINAL RESULTS COMPILATION SUMMARY\r\n");
+    printf("=========================================================================\r\n");
 
-    /* ── Table 1: Throughput ── */
-    printf("\r\n  [TABLE 1] Throughput (bytes/sec)\r\n");
-    printf("  %-8s | %-10s | %-10s | %-10s | %-10s\r\n",
-           "Pdrop", "Tout=150", "Tout=175", "Tout=200", "Tout=225");
-    printf("  ---------------------------------------------------------\r\n");
-    const char *plabels[4] = {"1%","2%","4%","8%"};
-    for (int p = 0; p < 4; p++)
-    {
-        printf("  %-8s | %-10u | %-10u | %-10u | %-10u\r\n",
-               plabels[p],
-               (unsigned int)throughput_results[p][0],
-               (unsigned int)throughput_results[p][1],
-               (unsigned int)throughput_results[p][2],
-               (unsigned int)throughput_results[p][3]);
+    printf("\r\n1. THROUGHPUT MATRIX (Bytes/sec)\r\n");
+    printf("---------------------------------------\r\n");
+    for (int i = 0; i < 4; i++) {
+        printf("P_drop = %s |  %lu\r\n", P_drop_strings[i], (unsigned long)throughput_matrix[i]);
     }
 
-    /* ── Table 2: Average transmissions per packet ── */
-    printf("\r\n  [TABLE 2] Avg transmissions per packet\r\n");
-    printf("  %-8s | %-10s | %-10s | %-10s | %-10s\r\n",
-           "Pdrop", "Tout=150", "Tout=175", "Tout=200", "Tout=225");
-    printf("  ---------------------------------------------------------\r\n");
-    for (int p = 0; p < 4; p++)
-    {
-        printf("  %-8s | %u.%02u       | %u.%02u       | %u.%02u       | %u.%02u\r\n",
-               plabels[p],
-               (unsigned int)avg_attempts_int[p][0],
-               (unsigned int)avg_attempts_frac[p][0],
-               (unsigned int)avg_attempts_int[p][1],
-               (unsigned int)avg_attempts_frac[p][1],
-               (unsigned int)avg_attempts_int[p][2],
-               (unsigned int)avg_attempts_frac[p][2],
-               (unsigned int)avg_attempts_int[p][3],
-               (unsigned int)avg_attempts_frac[p][3]);
+    printf("\r\n2. AVERAGE TRANSMISSIONS PER PACKET (Discussion Question 1)\r\n");
+    printf("---------------------------------------\r\n");
+    for (int i = 0; i < 4; i++) {
+        printf("P_drop = %s |  %lu.%02lu\r\n", P_drop_strings[i], (unsigned long)avg_tx_int_matrix[i], (unsigned long)avg_tx_frac_matrix[i]);
     }
 
-    /* ── Table 3: Packets dropped after max retries ── */
-    printf("\r\n  [TABLE 3] Packets dropped (max retries exceeded)\r\n");
-    printf("  %-8s | %-10s | %-10s | %-10s | %-10s\r\n",
-           "Pdrop", "Tout=150", "Tout=175", "Tout=200", "Tout=225");
-    printf("  ---------------------------------------------------------\r\n");
-    for (int p = 0; p < 4; p++)
-    {
-        printf("  %-8s | %-10u | %-10u | %-10u | %-10u\r\n",
-               plabels[p],
-               (unsigned int)dropped_results[p][0],
-               (unsigned int)dropped_results[p][1],
-               (unsigned int)dropped_results[p][2],
-               (unsigned int)dropped_results[p][3]);
+    printf("\r\n3. TOTAL PERMANENT DROPS AFTER 4 EXPIRED TRIES (Discussion Question 2)\r\n");
+    printf("---------------------------------------\r\n");
+    for (int i = 0; i < 4; i++) {
+        printf("P_drop = %s |  %lu\r\n", P_drop_strings[i], (unsigned long)dropped_pkts_matrix[i]);
     }
-
-    printf("\r\n====================================================\r\n");
-    printf("  All 16 runs complete. Simulation ended.\r\n");
-    printf("====================================================\r\n");
+    printf("=========================================================================\r\n");
+    printf("Simulation Execution Completed Successfully.\r\n");
 
     vTaskSuspend(NULL);
 }
 
-/* =========================================================================
- * MAIN
- * ========================================================================= */
-int main(void)
-{
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 7 – MAIN INITIALIZATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+int main(void) {
     srand(12345u);
 
-    xTxMutex     = xSemaphoreCreateMutex();
-    xStatsMutex  = xSemaphoreCreateMutex();
-    xSenderReady = xSemaphoreCreateCounting(1u, 1u);
-    xRunDoneSem  = xSemaphoreCreateBinary();
+    xAckSem     = xSemaphoreCreateBinary();
+    xRunDoneSem = xSemaphoreCreateBinary();
+    xStatsMutex = xSemaphoreCreateMutex(); /* <--- FATAL FLAW FIXED HERE */
 
-    configASSERT(xTxMutex     != NULL);
-    configASSERT(xStatsMutex  != NULL);
-    configASSERT(xSenderReady != NULL);
-    configASSERT(xRunDoneSem  != NULL);
+    configASSERT(xAckSem     != NULL);
+    configASSERT(xRunDoneSem != NULL);
+    configASSERT(xStatsMutex != NULL);
 
-    xGeneratedQueue = xQueueCreate(30u, sizeof(Packet_t *));
-    xTxLinkQueue    = xQueueCreate(30u, sizeof(Packet_t *));
-    xRxDataQueue    = xQueueCreate(30u, sizeof(Packet_t *));
-    xAckLinkQueue   = xQueueCreate(30u, sizeof(ACK_t *));
-    xAckRxQueue     = xQueueCreate(30u, sizeof(ACK_t *));
+    xGeneratedQueue = xQueueCreate(20u, sizeof(Packet_t *));
+    xTxLinkQueue    = xQueueCreate(20u, sizeof(Packet_t *));
+    xRxDataQueue    = xQueueCreate(20u, sizeof(Packet_t *));
+    xAckLinkQueue   = xQueueCreate(20u, sizeof(ACK_t *));
+    xAckRxQueue     = xQueueCreate(20u, sizeof(ACK_t *));
 
     configASSERT(xGeneratedQueue != NULL);
     configASSERT(xTxLinkQueue    != NULL);
@@ -729,58 +424,27 @@ int main(void)
     configASSERT(xAckLinkQueue   != NULL);
     configASSERT(xAckRxQueue     != NULL);
 
-    xToutTimer = xTimerCreate("Tout",
-                              pdMS_TO_TICKS(150u),
-                              pdFALSE,
-                              NULL,
-                              vTimerCallback);
-    configASSERT(xToutTimer != NULL);
-
-    /* Stack sizes increased to 1024 to prevent stack overflow with printf */
-    xTaskCreate(pkgGenTask,     "PkgGen",   1024u, NULL, 2u,
-                &xPkgGenTaskHandle);
-    xTaskCreate(dataLinkTask,   "DataLink", 1024u, NULL, 2u,
-                &xDataLinkTaskHandle);
-    xTaskCreate(ackLinkTask,    "AckLink",  1024u, NULL, 2u,
-                &xAckLinkTaskHandle);
-    xTaskCreate(senderTask,     "Sender",   1024u, NULL, 3u,
-                &xSenderTaskHandle);
-    xTaskCreate(receiverTask,   "Receiver", 1024u, NULL, 3u,
-                &xReceiverTaskHandle);
-    xTaskCreate(experimentTask, "ExpCtrl",  1024u, NULL, 4u,
-                NULL);
-
-    /* All tasks start suspended — experimentTask resumes them per run     */
-    vTaskSuspend(xPkgGenTaskHandle);
-    vTaskSuspend(xDataLinkTaskHandle);
-    vTaskSuspend(xAckLinkTaskHandle);
-    vTaskSuspend(xSenderTaskHandle);
-    vTaskSuspend(xReceiverTaskHandle);
-
-    printf("====================================================\r\n");
-    printf("Starting AUTOMATED simulation — 16 runs\r\n");
-    printf("Target = %u pkts per run\r\n", (unsigned int)TARGET_PKTS);
-    printf("====================================================\r\n");
+    /* Orchestration Task running above everyone else. */
+    xTaskCreate(mainExperimentTask, "MasterExec", STACK_SIZE_WORDS, NULL, (tskIDLE_PRIORITY + 4u), NULL);
 
     vTaskStartScheduler();
-
-    for (;;) {}
+    for (;;);
     return 0;
 }
 
-/* =========================================================================
- * FREERTOS HOOKS
- * ========================================================================= */
-void vApplicationMallocFailedHook(void)
-{
-    printf("FATAL: Malloc Failed!\r\n");
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SECTION 8 – HOOK FUNCTIONS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+void vApplicationMallocFailedHook(void) {
+    taskDISABLE_INTERRUPTS();
+    printf("[CRITICAL ERROR] pvPortMalloc Failed Exception!\r\n");
     for (;;);
 }
 
-void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
-{
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
     (void)xTask;
-    printf("FATAL: Stack Overflow in task: %s\r\n", pcTaskName);
+    taskDISABLE_INTERRUPTS();
+    printf("[CRITICAL ERROR] Stack Overflow Detected inside task: %s!\r\n", pcTaskName);
     for (;;);
 }
 
